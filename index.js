@@ -20,7 +20,8 @@ app.post('/api/explain', async (req, res) => {
       return res.status(500).json({ error: 'Server misconfigured: missing GEMINI_API_KEY' });
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const model = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -34,7 +35,9 @@ app.post('/api/explain', async (req, res) => {
     if (!response.ok) {
       const bodyText = await response.text().catch(() => '');
       console.error('Gemini API returned non-2xx', response.status, bodyText);
-      return res.status(502).json({ error: 'Upstream API error', status: response.status, body: bodyText });
+      // Return a usable explanation so the extension can display something instead of always falling back
+      const explanation = `(Server) Upstream API error ${response.status}: ${bodyText}`;
+      return res.status(200).json({ explanation, upstreamError: { status: response.status, body: bodyText } });
     }
 
     const data = await response.json();
