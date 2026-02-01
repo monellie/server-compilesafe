@@ -7,47 +7,86 @@ app.use(express.json({ limit: '10kb' })); // parse JSON requests
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Admin: list detected/candidate models and optional discovery
+// Admin: list detected/candidate models and optional discovery (try v1, then v1beta)
 let cachedModel = process.env.GEMINI_MODEL || null;
+let cachedModelApiVersion = null; // 'v1' or 'v1beta'
 const candidateModels = (process.env.GEMINI_MODEL_CANDIDATES || 'gemini-2.5,gemini-1.5-pro,text-bison-001').split(',').map(s => s.trim()).filter(Boolean);
+
+function genGenerateUrl(version, model) {
+  return `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+}
 
 async function probeModel(model) {
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: 'Model availability check' }] }] })
-    });
-    return resp.ok;
+    // Try v1 first
+    let url = genGenerateUrl('v1', model);
+    try {
+      let resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: 'Model availability check' }] }] })
+      });
+      if (resp.ok) return 'v1';
+    } catch (e) {
+      // ignore and try v1beta
+    }
+
+    // Fallback to v1beta
+    url = genGenerateUrl('v1beta', model);
+    try {
+      let resp2 = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: 'Model availability check' }] }] })
+      });
+      if (resp2.ok) return 'v1beta';
+    } catch (e) {
+      // ignore
+    }
+
+    return null;
   } catch (e) {
     console.error('probeModel error for', model, e && e.message);
-    return false;
+    return null;
   }
 }
 
 async function listAvailableModels() {
   try {
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`);
-    if (!resp.ok) return null;
-    const json = await resp.json();
-    return json.models || null;
+    // Try v1 models list first
+    let resp = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${process.env.GEMINI_API_KEY}`);
+    if (resp.ok) {
+      const json = await resp.json();
+      return json.models || null;
+    }
+  } catch (e) {
+    // ignore and try v1beta
+  }
+  try {
+    const resp2 = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`);
+    if (!resp2.ok) return null;
+    const json2 = await resp2.json();
+    return json2.models || null;
   } catch (e) {
     return null;
   }
 }
 
 async function detectModel() {
-  if (cachedModel) return cachedModel;
+  if (cachedModel && cachedModelApiVersion) return { model: cachedModel, version: cachedModelApiVersion };
   if (process.env.GEMINI_MODEL) {
     cachedModel = process.env.GEMINI_MODEL;
-    return cachedModel;
+    cachedModelApiVersion = process.env.GEMINI_MODEL_API_VERSION || 'v1';
+    return { model: cachedModel, version: cachedModelApiVersion };
   }
 
+  // Probe candidate models
   for (const m of candidateModels) {
-    if (await probeModel(m)) {
+    const ver = await probeModel(m);
+    if (ver) {
       cachedModel = m;
-      return m;
+      cachedModelApiVersion = ver;
+      return { model: m, version: ver };
     }
   }
 
@@ -56,9 +95,13 @@ async function detectModel() {
   if (Array.isArray(models)) {
     for (const mod of models) {
       const name = mod.name || mod.model || (typeof mod === 'string' ? mod : null);
-      if (name && await probeModel(name)) {
-        cachedModel = name;
-        return name;
+      if (name) {
+        const ver = await probeModel(name);
+        if (ver) {
+          cachedModel = name;
+          cachedModelApiVersion = ver;
+          return { model: name, version: ver };
+        }
       }
     }
   }
@@ -68,7 +111,7 @@ async function detectModel() {
 
 app.get('/models', async (req, res) => {
   const avail = await listAvailableModels();
-  res.json({ detected: cachedModel, candidates: candidateModels, available: avail });
+  res.json({ detected: cachedModel ? { model: cachedModel, version: cachedModelApiVersion } : null, candidates: candidateModels, available: avail });
 });
 
 // The endpoint your extension will call
@@ -84,14 +127,14 @@ app.post('/api/explain', async (req, res) => {
       return res.status(500).json({ error: 'Server misconfigured: missing GEMINI_API_KEY' });
     }
 
-    const model = await detectModel();
+    const det = await detectModel();
 
-    if (!model) {
+    if (!det) {
       const explanation = `(Server) No compatible model found. Please set GEMINI_MODEL manually or check available models at /models`;
       return res.status(200).json({ explanation });
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const url = genGenerateUrl(det.version, det.model);
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
